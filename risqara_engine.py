@@ -10,6 +10,7 @@ import os
 import re
 import json
 import time
+import html
 import logging
 import requests
 from datetime import datetime, timedelta
@@ -123,6 +124,19 @@ def analyze_sentiment(texts: list[str]) -> dict:
     }
 
 
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _strip_html(text: str) -> str:
+    """Google News RSS embeds raw HTML in its summary field (an <a> tag
+    wrapping the headline, sometimes a trailing <font> with the source
+    name) — left unstripped, that markup shows up as literal text in the
+    UI instead of being rendered. Strip tags, then unescape entities like
+    &amp;/&nbsp; that are left behind.
+    """
+    return html.unescape(_HTML_TAG_RE.sub("", text)).strip()
+
+
 # -----------------------------
 # 2. Free RSS News
 # -----------------------------
@@ -167,11 +181,20 @@ def fetch_free_rss_news(query: str, days_back: int = 5) -> tuple[list[str], list
                 if pub_time and pub_time < cutoff:
                     continue
 
-                title = (entry.get("title") or "").strip()
+                title = _strip_html((entry.get("title") or ""))
                 if not title:
                     continue
 
-                summary = (entry.get("summary") or entry.get("description") or "").strip()[:250]
+                summary = _strip_html((entry.get("summary") or entry.get("description") or ""))
+                # Google News' title is "<headline> - <source>" but its summary
+                # is "<headline>  <source>" (double-space, no dash) — so the
+                # dedup has to match against the headline alone, not the full
+                # title (which includes the " - Source" suffix the summary
+                # doesn't replicate), or "Title — Title  Source" slips through.
+                headline = title.rsplit(" - ", 1)[0]
+                if summary.lower().startswith(headline.lower()):
+                    summary = summary[len(headline):].strip()
+                summary = summary[:250]
                 full_text = f"{title} {summary}"
 
                 if is_general and not is_relevant(full_text):
