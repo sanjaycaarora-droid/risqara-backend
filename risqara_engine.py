@@ -12,6 +12,7 @@ import json
 import time
 import html
 import logging
+import threading
 import requests
 from datetime import datetime, timedelta
 import feedparser
@@ -24,6 +25,12 @@ load_dotenv()
 logger = logging.getLogger("risqara")
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
+
+# Optional: cross-checks Grok's risk score against Claude on the same input
+# data, logged only (see cross_check_with_claude) — no user-facing effect.
+# Degrades to a no-op if unset, same pattern as XAI_API_KEY above.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_MODEL = "claude-sonnet-5"
 
 # SEC requires a real contact identifier in the User-Agent for fair access.
 SEC_CONTACT_EMAIL = os.getenv("SEC_CONTACT_EMAIL", "sanjaycaarora@gmail.com")
@@ -745,15 +752,14 @@ def _call_grok_plain(prompt: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
-def get_grok_risk_profile(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
-                           pm: list[str], price: dict | None, stocktwits: dict,
-                           macro: list[str], reddit: list[str], wiki: dict | None) -> tuple[str, list[str]]:
-    """Returns (profile_text, live_source_urls). live_source_urls is empty
-    when live search is disabled, unavailable, or found nothing to cite.
+def _build_risk_prompt(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
+                        pm: list[str], price: dict | None, stocktwits: dict,
+                        macro: list[str], reddit: list[str], wiki: dict | None,
+                        live_search_directive: str = "") -> str:
+    """Builds the exact prompt handed to an LLM for risk scoring. Shared
+    between Grok (the primary model) and Claude (the quiet cross-check in
+    cross_check_with_claude) so both models are judged on identical input.
     """
-    if not XAI_API_KEY:
-        return "Grok API key missing. Add XAI_API_KEY to your .env file.", []
-
     news_text = "\n".join(news[:14]) or "(no recent news)"
     sec_text = "\n".join(sec_filings) if sec_filings else (
         "(No recent SEC filings found – likely private company, non-US entity, or industry theme)"
@@ -787,16 +793,6 @@ def get_grok_risk_profile(query: str, news: list[str], sentiment: dict, sec_fili
         )
     else:
         wiki_text = "(no matching Wikipedia article found)"
-
-    live_search_directive = ""
-    if ENABLE_LIVE_SEARCH:
-        live_search_directive = """
-LIVE SEARCH: You have x_search and web_search tools available. Use them to check
-recent X posts and current web coverage (last 7 days) about TARGET before finalizing
-your analysis, and fold anything genuinely relevant into Key Drivers. If a search
-turns up nothing relevant, say so in the Data Quality Note rather than inventing
-findings.
-"""
 
     prompt = f"""Perform a risk profile using ONLY free public data for:
 
@@ -851,6 +847,30 @@ Action: Buy / Hold / Trim / Avoid / Monitor – one sentence
 Data Quality Note: (mention which sections above were empty/unavailable and why,
 and whether live X/web search found anything relevant)
 """
+    return prompt
+
+
+def get_grok_risk_profile(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
+                           pm: list[str], price: dict | None, stocktwits: dict,
+                           macro: list[str], reddit: list[str], wiki: dict | None) -> tuple[str, list[str]]:
+    """Returns (profile_text, live_source_urls). live_source_urls is empty
+    when live search is disabled, unavailable, or found nothing to cite.
+    """
+    if not XAI_API_KEY:
+        return "Grok API key missing. Add XAI_API_KEY to your .env file.", []
+
+    live_search_directive = ""
+    if ENABLE_LIVE_SEARCH:
+        live_search_directive = """
+LIVE SEARCH: You have x_search and web_search tools available. Use them to check
+recent X posts and current web coverage (last 7 days) about TARGET before finalizing
+your analysis, and fold anything genuinely relevant into Key Drivers. If a search
+turns up nothing relevant, say so in the Data Quality Note rather than inventing
+findings.
+"""
+
+    prompt = _build_risk_prompt(query, news, sentiment, sec_filings, pm, price, stocktwits,
+                                 macro, reddit, wiki, live_search_directive)
 
     if ENABLE_LIVE_SEARCH:
         try:
@@ -862,6 +882,52 @@ and whether live X/web search found anything relevant)
         return _call_grok_plain(prompt), []
     except Exception as e:
         return f"Grok error: {e}", []
+
+
+def _call_claude(prompt: str) -> str:
+    payload = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 500,
+        "temperature": 0.3,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data["content"][0]["text"].strip()
+
+
+def cross_check_with_claude(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
+                             pm: list[str], price: dict | None, stocktwits: dict, macro: list[str],
+                             reddit: list[str], wiki: dict | None, grok_parsed: dict) -> None:
+    """Fire-and-forget: asks Claude to score the exact same data Grok just
+    saw, and logs how the two compare. Purely for internal QA on whether
+    Grok's score is a stable read or an outlier — never touches the response
+    sent to the app, and any failure here is swallowed so it can't affect
+    the actual request. Call from a background thread (see run_analysis).
+    """
+    if not ANTHROPIC_API_KEY:
+        return
+    try:
+        prompt = _build_risk_prompt(query, news, sentiment, sec_filings, pm, price, stocktwits, macro, reddit, wiki)
+        claude_text = _call_claude(prompt)
+        claude_parsed = parse_profile_text(claude_text)
+
+        grok_score = grok_parsed["risk_score"]
+        claude_score = claude_parsed["risk_score"]
+        diff = abs(grok_score - claude_score) if grok_score is not None and claude_score is not None else None
+
+        logger.info(
+            "CROSS-CHECK %r | grok_score=%s claude_score=%s diff=%s | grok_action=%s claude_action=%s",
+            query, grok_score, claude_score, diff, grok_parsed["action"], claude_parsed["action"],
+        )
+    except Exception as e:
+        logger.warning("Claude cross-check failed for %r: %s", query, e)
 
 
 # -----------------------------
@@ -931,6 +997,13 @@ def run_analysis(query: str) -> dict:
         query, news, sentiment, sec, pm, price, stocktwits, macro, reddit, wiki
     )
     parsed = parse_profile_text(profile_text)
+
+    if ANTHROPIC_API_KEY:
+        threading.Thread(
+            target=cross_check_with_claude,
+            args=(query, news, sentiment, sec, pm, price, stocktwits, macro, reddit, wiki, parsed),
+            daemon=True,
+        ).start()
 
     return {
         "query": query,

@@ -62,7 +62,11 @@ async def _run_analysis(query: str) -> dict:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "grok_configured": bool(engine.XAI_API_KEY)}
+    return {
+        "status": "ok",
+        "grok_configured": bool(engine.XAI_API_KEY),
+        "claude_cross_check_configured": bool(engine.ANTHROPIC_API_KEY),
+    }
 
 
 @app.post("/analyze")
