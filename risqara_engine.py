@@ -905,7 +905,14 @@ def _call_claude(prompt: str) -> str:
         # status line, leaving the real cause invisible in the logs.
         raise ValueError(f"Claude API {r.status_code}: {r.text[:500]}")
     data = r.json()
-    return data["content"][0]["text"].strip()
+    # Sonnet 5 does adaptive reasoning by default and can emit a "thinking"
+    # content block ahead of the actual answer, so the text block isn't
+    # reliably content[0] — scan for the block actually typed "text",
+    # same defensive pattern as the Grok /v1/responses parsing above.
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            return block["text"].strip()
+    raise ValueError(f"No text block in Claude response: {json.dumps(data)[:500]}")
 
 
 def cross_check_with_claude(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
