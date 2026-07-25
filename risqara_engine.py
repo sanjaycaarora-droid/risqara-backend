@@ -897,7 +897,11 @@ def _call_claude(prompt: str) -> str:
         "content-type": "application/json",
     }
     r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
+    if not r.ok:
+        # Anthropic puts the actual reason (bad key, invalid model, etc.) in
+        # the JSON body — raise_for_status() alone would only give the
+        # status line, leaving the real cause invisible in the logs.
+        raise ValueError(f"Claude API {r.status_code}: {r.text[:500]}")
     data = r.json()
     return data["content"][0]["text"].strip()
 
