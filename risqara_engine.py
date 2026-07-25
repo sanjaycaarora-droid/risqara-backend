@@ -667,8 +667,10 @@ def fetch_wikipedia_attention(query: str) -> dict | None:
 # -----------------------------
 # grok-4-1-fast (used here previously) was retired in May 2026 and now just
 # silently redirects to grok-4.3 — pinned explicitly rather than relying on
-# a deprecated alias that could stop redirecting at any point.
-GROK_MODEL = "grok-4.3"
+# a deprecated alias that could stop redirecting at any point. Moved on to
+# grok-4.5 (July 2026) once xAI marked it the recommended general-purpose
+# model and grok-4.3 became the legacy option.
+GROK_MODEL = "grok-4.5"
 
 # xAI retired the old chat-completions "search_parameters" Live Search
 # feature in January 2026. Its replacement is the /v1/responses endpoint
