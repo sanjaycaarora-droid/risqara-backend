@@ -888,7 +888,9 @@ def _call_claude(prompt: str) -> str:
     payload = {
         "model": CLAUDE_MODEL,
         "max_tokens": 500,
-        "temperature": 0.3,
+        # No `temperature` — Claude Sonnet 5 deprecated it in favor of the
+        # `effort` parameter (defaults to "high"), and rejects the request
+        # with a 400 if it's present.
         "messages": [{"role": "user", "content": prompt}],
     }
     headers = {
