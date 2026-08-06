@@ -11,8 +11,10 @@ Run locally:
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import logging
+import os
 
-from fastapi import FastAPI, HTTPException, Request
+import requests
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -20,6 +22,11 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 import risqara_engine as engine
+
+# Used only to service in-app account deletion (Apple Guideline 5.1.1(v)).
+# User identity lives entirely in Supabase; this backend has no user table.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -66,6 +73,7 @@ async def health():
         "status": "ok",
         "grok_configured": bool(engine.XAI_API_KEY),
         "claude_cross_check_configured": bool(engine.ANTHROPIC_API_KEY),
+        "account_deletion_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
     }
 
 
@@ -87,3 +95,52 @@ async def analyze_batch(request: Request, req: BatchAnalyzeRequest):
 
     results = await asyncio.gather(*(_run_analysis(q) for q in queries))
     return {"results": results}
+
+
+@app.delete("/account")
+@limiter.limit("5/hour")
+async def delete_account(request: Request, authorization: str = Header(None)):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(500, "Account deletion is not configured")
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    access_token = authorization.split(" ", 1)[1].strip()
+
+    # Resolve the caller's own user id from their session token — never trust
+    # a client-supplied id, so a caller can only ever delete their own account.
+    try:
+        user_resp = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {access_token}",
+            },
+            timeout=10,
+        )
+    except requests.RequestException:
+        raise HTTPException(502, "Could not reach the auth service, please try again")
+
+    if user_resp.status_code != 200:
+        raise HTTPException(401, "Invalid or expired session")
+    user_id = user_resp.json().get("id")
+    if not user_id:
+        raise HTTPException(401, "Invalid or expired session")
+
+    try:
+        delete_resp = requests.delete(
+            f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+            timeout=10,
+        )
+    except requests.RequestException:
+        raise HTTPException(502, "Could not reach the auth service, please try again")
+
+    if delete_resp.status_code not in (200, 204):
+        logging.error("Supabase account delete failed for %s: %s %s", user_id, delete_resp.status_code, delete_resp.text)
+        raise HTTPException(502, "Failed to delete account, please try again")
+
+    return {"status": "deleted"}
