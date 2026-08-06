@@ -119,6 +119,7 @@ async def delete_account(request: Request, authorization: str = Header(None)):
             timeout=10,
         )
     except requests.RequestException:
+        logging.exception("Supabase /auth/v1/user call failed (SUPABASE_URL=%r)", SUPABASE_URL)
         raise HTTPException(502, "Could not reach the auth service, please try again")
 
     if user_resp.status_code != 200:
@@ -137,6 +138,7 @@ async def delete_account(request: Request, authorization: str = Header(None)):
             timeout=10,
         )
     except requests.RequestException:
+        logging.exception("Supabase admin delete call failed (SUPABASE_URL=%r)", SUPABASE_URL)
         raise HTTPException(502, "Could not reach the auth service, please try again")
 
     if delete_resp.status_code not in (200, 204):
