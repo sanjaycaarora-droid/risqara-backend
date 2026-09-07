@@ -719,6 +719,14 @@ def _call_grok_with_live_search(prompt: str) -> tuple[str, list[str]]:
         ],
         "temperature": 0.3,
         "max_output_tokens": 900,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "risk_profile",
+                "schema": RISK_PROFILE_SCHEMA,
+                "strict": True,
+            }
+        },
     }
     r = requests.post("https://api.x.ai/v1/responses", headers=_grok_headers(), json=payload, timeout=45)
     r.raise_for_status()
@@ -749,11 +757,47 @@ def _call_grok_plain(prompt: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
         "max_tokens": 420,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "risk_profile", "schema": RISK_PROFILE_SCHEMA, "strict": True},
+        },
     }
     r = requests.post("https://api.x.ai/v1/chat/completions", headers=_grok_headers(), json=payload, timeout=30)
     r.raise_for_status()
     data = _decode_json_response(r)
     return data["choices"][0]["message"]["content"].strip()
+
+
+# Shared between Grok and Claude — both are asked to fill this exact shape via
+# each provider's native JSON-schema output mode (see _call_grok_plain,
+# _call_grok_with_live_search, _call_claude), so parse_profile_text below is
+# just a json.loads() rather than regex against free text. Field descriptions
+# do the job the old "Respond in exactly this structure" prompt text used to.
+RISK_PROFILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "risk_score": {
+            "type": "integer", "minimum": 0, "maximum": 100,
+            "description": "Overall risk score: 0 = lowest risk, 100 = highest risk.",
+        },
+        "key_drivers": {
+            "type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5,
+            "description": "1-5 concise bullet points explaining the score, each a full sentence or two.",
+        },
+        "sentiment": {"type": "string", "enum": ["Bullish", "Neutral", "Bearish", "Mixed"]},
+        "action": {"type": "string", "enum": ["Buy", "Hold", "Trim", "Avoid", "Monitor"]},
+        "action_note": {"type": "string", "description": "One sentence explaining the action."},
+        "data_quality_note": {
+            "type": "string",
+            "description": (
+                "Which sections above were empty/unavailable and why, and whether live "
+                "X/web search (if available) found anything relevant."
+            ),
+        },
+    },
+    "required": ["risk_score", "key_drivers", "sentiment", "action", "action_note", "data_quality_note"],
+    "additionalProperties": False,
+}
 
 
 def _build_risk_prompt(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
@@ -838,18 +882,6 @@ Breakdown: {sentiment['positive']} positive | {sentiment['negative']} negative |
 
 === FRED MACRO INDICATORS (broad economic backdrop, not target-specific) ===
 {macro_text}
-
-Respond in exactly this structure:
-
-Risk Score: XX/100
-Key Drivers:
-- ...
-- ...
-- ...
-Sentiment: Bullish / Neutral / Bearish / Mixed
-Action: Buy / Hold / Trim / Avoid / Monitor – one sentence
-Data Quality Note: (mention which sections above were empty/unavailable and why,
-and whether live X/web search found anything relevant)
 """
     return prompt
 
@@ -896,6 +928,7 @@ def _call_claude(prompt: str) -> str:
         # `effort` parameter (defaults to "high"), and rejects the request
         # with a 400 if it's present.
         "messages": [{"role": "user", "content": prompt}],
+        "output_config": {"format": {"type": "json_schema", "schema": RISK_PROFILE_SCHEMA}},
     }
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -948,48 +981,48 @@ def cross_check_with_claude(query: str, news: list[str], sentiment: dict, sec_fi
 
 
 # -----------------------------
-# 11. Parse the LLM's free-text profile into structured fields
+# 11. Parse the LLM's JSON profile into structured fields
 # -----------------------------
+_EMPTY_PROFILE = {
+    "risk_score": None,
+    "key_drivers": [],
+    "sentiment_label": None,
+    "action": None,
+    "action_note": None,
+    "data_quality_note": None,
+}
+
+
 def parse_profile_text(text: str) -> dict:
-    """Best-effort parse of the 'Risk Score / Key Drivers / Sentiment /
-    Action / Data Quality Note' structure into fields a UI can bind to
-    directly. Falls back gracefully if the model didn't follow the format.
+    """Parses the schema-enforced JSON response (see RISK_PROFILE_SCHEMA) into
+    the field names the rest of the app expects. Grok and Claude both return
+    a response guaranteed to match that schema via their native structured-
+    output modes, so this is just a load + light defensive clamping rather
+    than free-text regex — the only way this now falls back to the empty
+    profile is a genuine API-level failure (e.g. "Grok error: ..." strings
+    from get_grok_risk_profile's own error paths, which aren't JSON at all).
     """
-    risk_score = None
-    m = re.search(r"risk score\s*:\s*(\d{1,3})", text, re.IGNORECASE)
-    if m:
-        risk_score = max(0, min(100, int(m.group(1))))
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.warning("Profile response wasn't valid JSON (%s): %s", e, text[:200])
+        return dict(_EMPTY_PROFILE)
 
-    key_drivers = re.findall(r"^-\s*(.+)$", text, re.MULTILINE)
-    key_drivers = [d.strip() for d in key_drivers if d.strip() and d.strip() != "..."]
+    try:
+        risk_score = max(0, min(100, int(data["risk_score"])))
+    except (KeyError, TypeError, ValueError):
+        risk_score = None
 
-    sentiment_label = None
-    m = re.search(r"sentiment\s*:\s*([A-Za-z/ ]+)", text)
-    if m:
-        sentiment_label = m.group(1).strip().split("\n")[0]
-
-    action = None
-    action_note = None
-    # Separator-agnostic: match any short run of non-alphanumeric characters
-    # between the action word and the note, since the model (or a mangled
-    # dash upstream) may render the separator as -, –, —, or garbled bytes.
-    m = re.search(r"action\s*:\s*\**([A-Za-z]+)\**[^A-Za-z0-9]{1,4}(.+)", text, re.IGNORECASE)
-    if m:
-        action = m.group(1).strip()
-        action_note = m.group(2).strip().split("\n")[0]
-
-    data_quality_note = None
-    m = re.search(r"data quality note\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-    if m:
-        data_quality_note = m.group(1).strip()
+    key_drivers = data.get("key_drivers")
+    key_drivers = [str(d).strip() for d in key_drivers][:5] if isinstance(key_drivers, list) else []
 
     return {
         "risk_score": risk_score,
-        "key_drivers": key_drivers[:5],
-        "sentiment_label": sentiment_label,
-        "action": action,
-        "action_note": action_note,
-        "data_quality_note": data_quality_note,
+        "key_drivers": key_drivers,
+        "sentiment_label": data.get("sentiment"),
+        "action": data.get("action"),
+        "action_note": data.get("action_note"),
+        "data_quality_note": data.get("data_quality_note"),
     }
 
 
