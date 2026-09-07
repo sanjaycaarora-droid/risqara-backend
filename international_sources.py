@@ -1,0 +1,108 @@
+"""
+Reference map of non-US filing systems and local financial news sources —
+roadmap item 1 (international coverage). This is a DATA/REFERENCE module
+only; nothing here is wired into risqara_engine.py yet. Each market below
+is either "ready to integrate" (has a real, accessible API) or explicitly
+flagged as harder, so the next engineering step per market is honest about
+its own difficulty rather than uniform.
+
+Verified 2026-09-07 — API landscapes shift, so re-check before building
+against any of these if this file is more than a few months old.
+"""
+
+# -----------------------------------------------------------------------
+# Filing systems, by country. "api_status" is the single most important
+# field here — it tells you whether the next step is "sign up and build"
+# or "this needs a different approach entirely."
+# -----------------------------------------------------------------------
+FILING_SYSTEMS = {
+    "US": {
+        "exchanges": ["NYSE", "NASDAQ"],
+        "system": "SEC EDGAR",
+        "api_status": "integrated",
+        "api_url": "https://www.sec.gov/edgar",
+        "notes": "Already live in risqara_engine.py (fetch_sec_filings). Free, no key required.",
+    },
+    "CA": {
+        "exchanges": ["TSX", "TSXV"],
+        "system": "SEDAR+",
+        "api_status": "unclear — public web search is free, but a direct official free API "
+                       "wasn't found. Third-party vendors (e.g. QuoteMedia) resell SEDAR+ data "
+                       "via their own commercial APIs. Needs a follow-up call to CSA/SEDAR+ "
+                       "support to confirm whether a free developer API exists before building.",
+        "api_url": "https://www.sedarplus.ca",
+        "notes": "Example: any TSX-listed company, e.g. Shopify, RBC.",
+    },
+    "GB": {
+        "exchanges": ["LSE"],
+        "system": "Companies House",
+        "api_status": "ready — official, free, no per-call charges. Sign up at "
+                       "developer.company-information.service.gov.uk for an API key.",
+        "api_url": "https://developer.company-information.service.gov.uk/",
+        "notes": (
+            "Covers company filings/accounts, not the LSE's own Regulatory News Service (RNS) "
+            "for market announcements — that's a separate, less openly-documented feed. Start "
+            "with Companies House for filings; revisit RNS access separately if needed."
+        ),
+    },
+    "JP": {
+        "exchanges": ["TSE (Tokyo Stock Exchange)"],
+        "system": "EDINET",
+        "api_status": "ready — official free API (needs a free key from the FSA). A third-party "
+                       "(edinetdb.com) also offers a free tier (100 req/day) if the official "
+                       "one proves awkward to integrate directly.",
+        "api_url": "https://disclosure2dl.edinet-fsa.go.jp/guide/static/disclosure/WZEK0110.html",
+        "notes": "Example: Sony, Toyota. Official docs are Japanese-first; EDINET DB's docs are English.",
+    },
+    "KR": {
+        "exchanges": ["KRX (KOSPI/KOSDAQ)"],
+        "system": "DART / OpenDART",
+        "api_status": "ready — official free Open API, JSON + XBRL. Korea has been expanding "
+                       "an English-language disclosure layer through 2026, which should make "
+                       "this one of the more approachable non-English-market integrations.",
+        "api_url": "https://opendart.fss.or.kr/",
+        "notes": "Example: Samsung, SK Hynix. englishdart.fss.or.kr is the English-facing portal.",
+    },
+    "IN": {
+        "exchanges": ["BSE", "NSE"],
+        "system": "BSE/NSE corporate announcements",
+        "api_status": "hard — no official public API. Real options are unofficial scraping "
+                       "libraries (fragile, carries ToS risk, breaks on site changes) or paid "
+                       "commercial vendors (quoted around ₹3 lakh/year for official BSE data). "
+                       "Not recommended as a first build target given the cost/fragility tradeoff.",
+        "api_url": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+        "notes": (
+            "Example: HDFC Bank. Until a real API path exists, this market is better served by "
+            "the local news sources below plus Grok's live web search than by a formal filings feed."
+        ),
+    },
+}
+
+# -----------------------------------------------------------------------
+# Local financial news/data sources worth folding into the news-fetch step
+# per region — lower effort than filing-system integration, and covers the
+# gap for markets (like India) where formal filings access is hard.
+# Add each as an RSS/API source in risqara_engine.py's news fetcher once
+# a feed URL or API is confirmed for it.
+# -----------------------------------------------------------------------
+LOCAL_NEWS_SOURCES = {
+    "CA": ["The Globe and Mail (Report on Business)", "Financial Post"],
+    "GB": ["Financial Times", "This Is Money", "London Stock Exchange RNS feed"],
+    "JP": ["Nikkei Asia", "Japan Times (business)"],
+    "KR": ["Korea Herald (business)", "Yonhap Infomax"],
+    "IN": ["Economic Times", "Moneycontrol", "Business Standard"],
+}
+
+# -----------------------------------------------------------------------
+# Next steps, in the order they should actually happen — not all five
+# markets are the same amount of work, so don't batch them as one task.
+# -----------------------------------------------------------------------
+# 1. GB (Companies House) — register a free API key, build fetch_uk_filings()
+#    mirroring fetch_sec_filings()'s shape. Lowest-risk first integration.
+# 2. JP (EDINET) — register a free API key, build fetch_jp_filings().
+# 3. KR (OpenDART) — register a free API key, build fetch_kr_filings().
+# 4. CA (SEDAR+) — confirm whether a free official API actually exists
+#    before committing engineering time; may end up local-news-only.
+# 5. IN — skip formal filings integration for now; add the local news
+#    sources above to the news fetcher instead, and lean on Grok's live
+#    web/X search (already enabled) to cover the gap.
