@@ -399,10 +399,18 @@ def fetch_uk_filings(query: str, limit: int = 8) -> list[str]:
 # unlisted companies) downloaded once and cached in memory. Re-fetching
 # this per request would be both slow and pointless, since the mapping is
 # effectively static within a process's lifetime.
-_kr_corp_code_cache: dict[str, str] | None = None
+#
+# The list is dominated by small/unlisted entities that happen to share a
+# well-known name — e.g. querying "Samsung" turns up ~240 entries (funds,
+# shell companies, securitization vehicles, defunct subsidiaries) before
+# you even reach "Samsung Electronics" itself. Each value below also
+# carries whether the entity has a real KRX stock_code, since that's the
+# strongest available signal for "this is the actual listed company," not
+# some unrelated entity that merely contains the same word.
+_kr_corp_code_cache: dict[str, dict] | None = None
 
 
-def _get_kr_corp_code_map() -> dict[str, str]:
+def _get_kr_corp_code_map() -> dict[str, dict]:
     global _kr_corp_code_cache
     if _kr_corp_code_cache is not None:
         return _kr_corp_code_cache
@@ -417,10 +425,19 @@ def _get_kr_corp_code_map() -> dict[str, str]:
         with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
             xml_bytes = zf.read(zf.namelist()[0])
         for entry in ET.fromstring(xml_bytes).findall("list"):
-            name = (entry.findtext("corp_name") or "").strip()
             code = (entry.findtext("corp_code") or "").strip()
-            if name and code:
-                _kr_corp_code_cache[name.lower()] = code
+            if not code:
+                continue
+            listed = bool((entry.findtext("stock_code") or "").strip())
+            # corp_name is Korean script (e.g. "삼성전자") — matching that
+            # against a Latin-script query like "Samsung" would basically
+            # never hit. corp_eng_name (e.g. "Samsung Electronics Co.,Ltd.")
+            # is what an English-language query actually needs; index both
+            # so a query in either language works.
+            for field in ("corp_name", "corp_eng_name"):
+                name = (entry.findtext(field) or "").strip()
+                if name:
+                    _kr_corp_code_cache[name.lower()] = {"code": code, "listed": listed}
         logger.info("OpenDART corp_code map loaded: %d companies", len(_kr_corp_code_cache))
     except Exception as e:
         logger.warning("OpenDART corp_code fetch failed: %s", e)
@@ -431,19 +448,35 @@ def fetch_kr_filings(query: str, limit: int = 8) -> list[str]:
     """Korea DART/OpenDART — roadmap item 1. Matches query as a case-
     insensitive substring against the cached corp_code list's DART-
     registered names (e.g. "samsung" matches "Samsung Electronics Co.,Ltd."),
-    since there's no live search endpoint to query directly."""
+    since there's no live search endpoint to query directly. Among multiple
+    substring matches, prefers ones with a real KRX stock_code (i.e.
+    actually publicly listed) and, as a tiebreaker, the shortest matching
+    name — the flagship entity is usually named more simply than the
+    subsidiaries/funds/shells that also happen to match."""
     if not OPENDART_API_KEY:
         return []
     try:
         corp_map = _get_kr_corp_code_map()
         q = query.strip().lower()
-        corp_code = next((code for name, code in corp_map.items() if q in name), None)
-        if not corp_code:
+        candidates = [(name, info) for name, info in corp_map.items() if q in name]
+        if not candidates:
             return []
+        candidates.sort(key=lambda nc: (not nc[1]["listed"], len(nc[0])))
+        corp_code = candidates[0][1]["code"]
 
+        # Unlike SEC/UK, list.json returns status "013" (no data) rather
+        # than "recent filings" if bgn_de/end_de are omitted — it doesn't
+        # default to a sensible window on its own. 2 years back is wide
+        # enough to catch companies that file less frequently.
+        today = datetime.now().strftime("%Y%m%d")
+        two_years_ago = (datetime.now() - timedelta(days=730)).strftime("%Y%m%d")
         r = requests.get(
             "https://opendart.fss.or.kr/api/list.json",
-            params={"crtfc_key": OPENDART_API_KEY, "corp_code": corp_code, "page_count": limit},
+            params={
+                "crtfc_key": OPENDART_API_KEY, "corp_code": corp_code,
+                "bgn_de": two_years_ago, "end_de": today,
+                "page_count": limit, "sort": "date", "sort_mth": "desc",
+            },
             timeout=10,
         )
         r.raise_for_status()

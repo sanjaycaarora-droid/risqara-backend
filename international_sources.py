@@ -26,10 +26,12 @@ FILING_SYSTEMS = {
     "CA": {
         "exchanges": ["TSX", "TSXV"],
         "system": "SEDAR+",
-        "api_status": "unclear — public web search is free, but a direct official free API "
-                       "wasn't found. Third-party vendors (e.g. QuoteMedia) resell SEDAR+ data "
-                       "via their own commercial APIs. Needs a follow-up call to CSA/SEDAR+ "
-                       "support to confirm whether a free developer API exists before building.",
+        "api_status": "hard — confirmed (2026-09-07) there is no official public API at all. "
+                       "Anonymous public access is browser-search-only, capped at exporting 30 "
+                       "documents at a time as CSV. Real options are browser-automation scraping "
+                       "against the public UI (fragile, ToS risk) or a paid third-party vendor "
+                       "(e.g. QuoteMedia). Reclassified from 'moderate' to the same tier as "
+                       "Italy/India — no free API path exists, period.",
         "api_url": "https://www.sedarplus.ca",
         "notes": "Example: any TSX-listed company, e.g. Shopify, RBC.",
     },
@@ -146,11 +148,13 @@ LOCAL_NEWS_SOURCES = {
 # as one task — three are genuinely ready, three are commercial/uncertain,
 # two are hard-skip-for-now.
 # -----------------------------------------------------------------------
-# TIER 1 — ready now, official free APIs, build these first:
-# 1. GB (Companies House) — register a free API key, build fetch_uk_filings()
-#    mirroring fetch_sec_filings()'s shape. Lowest-risk first integration.
-# 2. JP (EDINET) — register a free API key, build fetch_jp_filings().
-# 3. KR (OpenDART) — register a free API key, build fetch_kr_filings().
+# TIER 1 — ready now, official free APIs. GB and KR are DONE (see
+# fetch_uk_filings/fetch_kr_filings below); JP still needs exploration
+# since its official API is date-indexed, not company-search-shaped:
+# 1. GB (Companies House) — DONE, tested against a real key, working.
+# 2. JP (EDINET) — register a free key, but expect to design around the
+#    date-indexed shape rather than mirror fetch_sec_filings() directly.
+# 3. KR (OpenDART) — DONE, tested against a real key, working.
 #
 # TIER 2 — accessible, but only via paid/third-party services or an
 # unconfirmed official path. Worth a deliberate call before building,
@@ -158,13 +162,12 @@ LOCAL_NEWS_SOURCES = {
 # "sign up for a free key":
 # 4. DE (Bundesanzeiger/Unternehmensregister) — a third-party wrapper
 #    (OpenRegister, handelsregister.ai) is the realistic path.
-# 5. CA (SEDAR+) — confirm whether a free official API actually exists
-#    before committing engineering time; may end up local-news-only.
-# 6. FR (AMF) — similar shape to Germany, commercial aggregators only.
+# 5. FR (AMF) — similar shape to Germany, commercial aggregators only.
 #
 # TIER 3 — hard, skip formal filings integration for now. Add the local
 # news sources above to the news fetcher instead, and lean on Grok's live
 # web/X search (already enabled) to cover the gap:
+# 6. CA (SEDAR+) — confirmed no public API exists at all (2026-09-07).
 # 7. IT (CONSOB/1Info) — no public API found.
 # 8. IN (BSE/NSE) — no official public API found.
 #
