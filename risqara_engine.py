@@ -7,13 +7,16 @@ callers get return values and can log/display them however they like.
 """
 
 import os
+import io
 import re
 import json
 import time
 import html
+import zipfile
 import logging
 import threading
 import requests
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 import feedparser
 from dotenv import load_dotenv
@@ -42,6 +45,13 @@ FRED_API_KEY = os.getenv("FRED_API_KEY")
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 REDDIT_USER_AGENT = f"Risqara/1.0 (by /u/{os.getenv('REDDIT_USERNAME', 'risqara_app')})"
+
+# International filings (roadmap item 1 — see international_sources.py for
+# the full market-by-market status). Register a free key at
+# developer.company-information.service.gov.uk for the UK one, and at
+# opendart.fss.or.kr for the Korean one.
+COMPANIES_HOUSE_API_KEY = os.getenv("COMPANIES_HOUSE_API_KEY")
+OPENDART_API_KEY = os.getenv("OPENDART_API_KEY")
 
 _CRYPTO_ALIASES = {
     "BITCOIN": "BTC", "BTC": "BTC",
@@ -345,6 +355,107 @@ def fetch_sec_filings(query: str, limit: int = 8) -> list[str]:
         return filings
     except Exception as e:
         logger.warning("SEC EDGAR fetch failed: %s", e)
+        return []
+
+
+def fetch_uk_filings(query: str, limit: int = 8) -> list[str]:
+    """UK Companies House — roadmap item 1 (see international_sources.py).
+    Auth is HTTP Basic with the API key as username and a blank password,
+    per Companies House's own convention (not a header or bearer token)."""
+    if not COMPANIES_HOUSE_API_KEY:
+        return []
+    auth = (COMPANIES_HOUSE_API_KEY, "")
+    try:
+        search = requests.get(
+            "https://api.company-information.service.gov.uk/search/companies",
+            params={"q": query, "items_per_page": 1},
+            auth=auth,
+            timeout=10,
+        )
+        search.raise_for_status()
+        items = search.json().get("items", [])
+        company_number = items[0].get("company_number") if items else None
+        if not company_number:
+            return []
+
+        history = requests.get(
+            f"https://api.company-information.service.gov.uk/company/{company_number}/filing-history",
+            params={"items_per_page": limit},
+            auth=auth,
+            timeout=10,
+        )
+        history.raise_for_status()
+        return [
+            f"[UK] {item.get('date', '')} | {item.get('type', '')} | {item.get('description', '')}"
+            for item in history.json().get("items", [])[:limit]
+        ]
+    except Exception as e:
+        logger.warning("UK Companies House fetch failed: %s", e)
+        return []
+
+
+# OpenDART has no live "search by company name" endpoint — matching a
+# company requires a bulk corp_code list (every KRX-listed and many
+# unlisted companies) downloaded once and cached in memory. Re-fetching
+# this per request would be both slow and pointless, since the mapping is
+# effectively static within a process's lifetime.
+_kr_corp_code_cache: dict[str, str] | None = None
+
+
+def _get_kr_corp_code_map() -> dict[str, str]:
+    global _kr_corp_code_cache
+    if _kr_corp_code_cache is not None:
+        return _kr_corp_code_cache
+    _kr_corp_code_cache = {}
+    try:
+        r = requests.get(
+            "https://opendart.fss.or.kr/api/corpCode.xml",
+            params={"crtfc_key": OPENDART_API_KEY},
+            timeout=20,
+        )
+        r.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            xml_bytes = zf.read(zf.namelist()[0])
+        for entry in ET.fromstring(xml_bytes).findall("list"):
+            name = (entry.findtext("corp_name") or "").strip()
+            code = (entry.findtext("corp_code") or "").strip()
+            if name and code:
+                _kr_corp_code_cache[name.lower()] = code
+        logger.info("OpenDART corp_code map loaded: %d companies", len(_kr_corp_code_cache))
+    except Exception as e:
+        logger.warning("OpenDART corp_code fetch failed: %s", e)
+    return _kr_corp_code_cache
+
+
+def fetch_kr_filings(query: str, limit: int = 8) -> list[str]:
+    """Korea DART/OpenDART — roadmap item 1. Matches query as a case-
+    insensitive substring against the cached corp_code list's DART-
+    registered names (e.g. "samsung" matches "Samsung Electronics Co.,Ltd."),
+    since there's no live search endpoint to query directly."""
+    if not OPENDART_API_KEY:
+        return []
+    try:
+        corp_map = _get_kr_corp_code_map()
+        q = query.strip().lower()
+        corp_code = next((code for name, code in corp_map.items() if q in name), None)
+        if not corp_code:
+            return []
+
+        r = requests.get(
+            "https://opendart.fss.or.kr/api/list.json",
+            params={"crtfc_key": OPENDART_API_KEY, "corp_code": corp_code, "page_count": limit},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") != "000":  # OpenDART's own "no data"/error status
+            return []
+        return [
+            f"[KR] {item.get('rcept_dt', '')} | {item.get('report_nm', '')}"
+            for item in data.get("list", [])[:limit]
+        ]
+    except Exception as e:
+        logger.warning("Korea OpenDART fetch failed: %s", e)
         return []
 
 
@@ -810,7 +921,8 @@ def _build_risk_prompt(query: str, news: list[str], sentiment: dict, sec_filings
     """
     news_text = "\n".join(news[:14]) or "(no recent news)"
     sec_text = "\n".join(sec_filings) if sec_filings else (
-        "(No recent SEC filings found – likely private company, non-US entity, or industry theme)"
+        "(No regulatory filings found — private company, industry theme, or a market not yet "
+        "covered: currently SEC EDGAR for US, Companies House for UK, DART for Korea)"
     )
     pm_text = "\n".join(pm) if pm else "(no related prediction markets found on Polymarket)"
 
@@ -862,7 +974,7 @@ Breakdown: {sentiment['positive']} positive | {sentiment['negative']} negative |
 === RECENT NEWS ===
 {news_text}
 
-=== SEC EDGAR FILINGS (US public companies only) ===
+=== REGULATORY FILINGS (SEC EDGAR/US, Companies House/UK, DART/Korea) ===
 {sec_text}
 
 === PRICE / VOLATILITY (Yahoo Finance) ===
@@ -1033,7 +1145,14 @@ def run_analysis(query: str) -> dict:
     """Run the full pipeline for a single target and return structured JSON."""
     news, clean_texts = fetch_free_rss_news(query)
     sentiment = analyze_sentiment(clean_texts)
-    sec = fetch_sec_filings(query)
+    # US SEC filings plus international ones (roadmap item 1 — UK and Korea
+    # so far, see international_sources.py). Merged into one list rather
+    # than threading new parameters through every function in the prompt/
+    # scoring pipeline — each source no-ops to [] if its query doesn't
+    # match anything there or its API key isn't configured, so this is
+    # safe to call unconditionally for every query regardless of the
+    # target's actual country.
+    sec = fetch_sec_filings(query) + fetch_uk_filings(query) + fetch_kr_filings(query)
     pm = fetch_polymarket(query)
 
     symbol, is_crypto = resolve_symbol(query)
