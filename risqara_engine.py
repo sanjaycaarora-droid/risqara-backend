@@ -1048,6 +1048,15 @@ recent X posts and current web coverage (last 7 days) about TARGET before finali
 your analysis, and fold anything genuinely relevant into Key Drivers. If a search
 turns up nothing relevant, say so in the Data Quality Note rather than inventing
 findings.
+
+If TARGET is a specific company (not a theme or asset class), also use web_search to
+check whether TARGET's own official website has an investor relations section with a
+recent earnings release, financial results, or investor presentation. Treat anything
+found there as a primary source — the company's own reported numbers and guidance —
+and call it out distinctly from third-party news commentary in Key Drivers (e.g.
+"Per the company's own Q3 investor release, ..."). If you can't find or confirm the
+company's official site, say so in the Data Quality Note rather than guessing at a
+domain or inventing figures.
 """
 
     prompt = _build_risk_prompt(query, news, sentiment, sec_filings, pm, price, stocktwits,
@@ -1123,6 +1132,85 @@ def cross_check_with_claude(query: str, news: list[str], sentiment: dict, sec_fi
         )
     except Exception as e:
         logger.warning("Claude cross-check failed for %r: %s", query, e)
+
+
+# -----------------------------
+# 10.5 Deterministic quantitative risk score (roadmap item 2)
+# -----------------------------
+# Grok/Claude's own self-reported scores are judgment calls — even at low
+# temperature, neither model guarantees the same number twice for the same
+# input. This computes the actual DISPLAYED risk score as a plain Python
+# formula over objective signals already being fetched, so identical
+# inputs always produce the identical output, by construction rather than
+# by hoping an LLM behaves consistently.
+#
+# Each signal is mapped to its own 0-100 sub-score (100 = highest risk),
+# weighted, and averaged — with weights renormalized across whichever
+# signals are actually available for this query, so a private company
+# with only news sentiment isn't dragged toward a phantom "50" for the
+# price/volatility/crowd-sentiment signals it doesn't have.
+#
+# Weights below are a reasoned starting point (documented, not black-box),
+# not a backtested/calibrated model — see roadmap item 2's follow-up:
+# persist scores and check them against what actually happened.
+_QUANT_WEIGHTS = {
+    "sentiment": 0.35,     # news sentiment — broadest coverage, most queries have this
+    "volatility": 0.25,    # 30-day volatility — only when price resolves
+    "day_change": 0.15,    # magnitude of latest day's move — only when price resolves
+    "range_position": 0.15,  # distance from mid-point of 52-week range — only when price resolves
+    "stocktwits": 0.10,    # crowd bearish/bullish ratio — only when StockTwits has activity
+}
+
+
+def compute_quant_risk_score(sentiment: dict, price: dict | None, stocktwits: dict) -> dict:
+    """Returns {"score": int 0-100, "components": {...}} — components lists
+    which sub-scores were actually used, for transparency/debugging (not
+    currently surfaced to the app, but useful for tuning the weights later
+    once real outcomes can be checked against them).
+    """
+    contributions: dict[str, float] = {}
+
+    if sentiment.get("total", 0) > 0:
+        # compound ranges -1 (most negative) .. +1 (most positive)
+        compound = sentiment.get("average_compound", 0.0)
+        contributions["sentiment"] = (1 - compound) / 2 * 100
+
+    if price:
+        volatility = price.get("thirty_day_volatility_pct")
+        if volatility is not None:
+            contributions["volatility"] = min(100.0, (volatility / 60.0) * 100)
+
+        day_change = price.get("day_change_pct")
+        if day_change is not None:
+            contributions["day_change"] = min(100.0, (abs(day_change) / 10.0) * 100)
+
+        low = price.get("fifty_two_week_low")
+        high = price.get("fifty_two_week_high")
+        current = price.get("price")
+        if low is not None and high is not None and current is not None and high > low:
+            # U-shaped: lowest risk at the midpoint of the 52-week range,
+            # highest risk at either extreme (topping-out risk near the
+            # high, further-decline risk near the low) — this is exactly
+            # the "near 52-week high → elevated pullback risk" reasoning
+            # Grok has produced on its own in real output, just made
+            # deterministic instead of re-derived by the model each time.
+            position = (current - low) / (high - low)
+            position = max(0.0, min(1.0, position))
+            contributions["range_position"] = abs(position - 0.5) * 2 * 100
+
+    if stocktwits.get("total", 0) > 0:
+        bearish_ratio = stocktwits.get("bearish", 0) / stocktwits["total"]
+        contributions["stocktwits"] = bearish_ratio * 100
+
+    if not contributions:
+        # No usable signal at all (e.g. an unresolvable query with zero
+        # news) — genuinely nothing to compute from, not a bug.
+        return {"score": 50, "components": {}}
+
+    total_weight = sum(_QUANT_WEIGHTS[k] for k in contributions)
+    weighted_sum = sum(_QUANT_WEIGHTS[k] * v for k, v in contributions.items())
+    score = round(weighted_sum / total_weight)
+    return {"score": max(0, min(100, score)), "components": contributions}
 
 
 # -----------------------------
