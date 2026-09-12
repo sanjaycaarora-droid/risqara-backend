@@ -1108,12 +1108,16 @@ def _call_claude(prompt: str) -> str:
 
 def cross_check_with_claude(query: str, news: list[str], sentiment: dict, sec_filings: list[str],
                              pm: list[str], price: dict | None, stocktwits: dict, macro: list[str],
-                             reddit: list[str], wiki: dict | None, grok_parsed: dict) -> None:
+                             reddit: list[str], wiki: dict | None, grok_parsed: dict,
+                             quant_score: int | None = None) -> None:
     """Fire-and-forget: asks Claude to score the exact same data Grok just
-    saw, and logs how the two compare. Purely for internal QA on whether
-    Grok's score is a stable read or an outlier — never touches the response
-    sent to the app, and any failure here is swallowed so it can't affect
-    the actual request. Call from a background thread (see run_analysis).
+    saw, and logs how both compare against each other AND against the
+    deterministic quant score (roadmap item 2) that's actually displayed
+    to users. Purely for internal QA — is the quant formula pointing the
+    same direction as AI judgment, or is Grok/Claude an outlier — never
+    touches the response sent to the app, and any failure here is
+    swallowed so it can't affect the actual request. Call from a
+    background thread (see run_analysis).
     """
     if not ANTHROPIC_API_KEY:
         return
@@ -1124,11 +1128,15 @@ def cross_check_with_claude(query: str, news: list[str], sentiment: dict, sec_fi
 
         grok_score = grok_parsed["risk_score"]
         claude_score = claude_parsed["risk_score"]
-        diff = abs(grok_score - claude_score) if grok_score is not None and claude_score is not None else None
+        grok_claude_diff = abs(grok_score - claude_score) if grok_score is not None and claude_score is not None else None
+        quant_grok_diff = abs(quant_score - grok_score) if quant_score is not None and grok_score is not None else None
+        quant_claude_diff = abs(quant_score - claude_score) if quant_score is not None and claude_score is not None else None
 
         logger.info(
-            "CROSS-CHECK %r | grok_score=%s claude_score=%s diff=%s | grok_action=%s claude_action=%s",
-            query, grok_score, claude_score, diff, grok_parsed["action"], claude_parsed["action"],
+            "CROSS-CHECK %r | quant=%s grok=%s claude=%s | grok_vs_claude=%s quant_vs_grok=%s "
+            "quant_vs_claude=%s | grok_action=%s claude_action=%s",
+            query, quant_score, grok_score, claude_score, grok_claude_diff, quant_grok_diff,
+            quant_claude_diff, grok_parsed["action"], claude_parsed["action"],
         )
     except Exception as e:
         logger.warning("Claude cross-check failed for %r: %s", query, e)
@@ -1288,10 +1296,16 @@ def run_analysis(query: str) -> dict:
     )
     parsed = parse_profile_text(profile_text)
 
+    # Roadmap item 2: the displayed score is now this deterministic formula,
+    # not Grok's self-reported one — same inputs always produce the same
+    # score. Grok/Claude's own numbers still get computed (see cross-check
+    # below) purely as an internal QA signal, never shown to users.
+    quant = compute_quant_risk_score(sentiment, price, stocktwits)
+
     if ANTHROPIC_API_KEY:
         threading.Thread(
             target=cross_check_with_claude,
-            args=(query, news, sentiment, sec, pm, price, stocktwits, macro, reddit, wiki, parsed),
+            args=(query, news, sentiment, sec, pm, price, stocktwits, macro, reddit, wiki, parsed, quant["score"]),
             daemon=True,
         ).start()
 
@@ -1309,7 +1323,7 @@ def run_analysis(query: str) -> dict:
         "reddit_mentions": reddit,
         "wikipedia_attention": wiki,
         "sentiment": sentiment,
-        "risk_score": parsed["risk_score"],
+        "risk_score": quant["score"],
         "key_drivers": parsed["key_drivers"],
         "sentiment_label": parsed["sentiment_label"] or sentiment["label"],
         "action": parsed["action"],
