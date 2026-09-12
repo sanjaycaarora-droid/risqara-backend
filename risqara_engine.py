@@ -921,11 +921,22 @@ RISK_PROFILE_SCHEMA = {
     "type": "object",
     "properties": {
         "risk_score": {
-            "type": "integer", "minimum": 0, "maximum": 100,
+            # No minimum/maximum here — Claude's structured-output schema
+            # validator rejects those constraints on integer properties
+            # ("properties maximum, minimum are not supported"), and Grok
+            # accepts the schema either way. The 0-100 range is stated in
+            # the description instead, and parse_profile_text clamps
+            # defensively regardless of what comes back.
+            "type": "integer",
             "description": "Overall risk score: 0 = lowest risk, 100 = highest risk.",
         },
         "key_drivers": {
-            "type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5,
+            # No minItems/maxItems — same Claude schema-validator rejection
+            # as risk_score's minimum/maximum above ("property 'maxItems'
+            # is not supported"). The 1-5 guidance lives in the description
+            # instead, and parse_profile_text already truncates to 5
+            # defensively regardless of what comes back.
+            "type": "array", "items": {"type": "string"},
             "description": "1-5 concise bullet points explaining the score, each a full sentence or two.",
         },
         "sentiment": {"type": "string", "enum": ["Bullish", "Neutral", "Bearish", "Mixed"]},
@@ -1077,7 +1088,12 @@ domain or inventing figures.
 def _call_claude(prompt: str) -> str:
     payload = {
         "model": CLAUDE_MODEL,
-        "max_tokens": 500,
+        # 500 was too low — Sonnet 5's adaptive thinking (effort defaults to
+        # "high") can consume the whole budget reasoning internally before
+        # ever emitting the actual structured output, leaving a response
+        # with only an empty "thinking" block and no text block at all.
+        # Raised well past what the reasoning + JSON output actually need.
+        "max_tokens": 2048,
         # No `temperature` — Claude Sonnet 5 deprecated it in favor of the
         # `effort` parameter (defaults to "high"), and rejects the request
         # with a 400 if it's present.
