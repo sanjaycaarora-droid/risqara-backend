@@ -74,6 +74,8 @@ async def health():
         "grok_configured": bool(engine.XAI_API_KEY),
         "claude_cross_check_configured": bool(engine.ANTHROPIC_API_KEY),
         "account_deletion_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
+        "uk_filings_configured": bool(engine.COMPANIES_HOUSE_API_KEY),
+        "kr_filings_configured": bool(engine.OPENDART_API_KEY),
     }
 
 
